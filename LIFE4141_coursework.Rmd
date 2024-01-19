@@ -1,0 +1,549 @@
+---
+title: "LIFE4141_coursework"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+options(warn=1)
+
+library(adegenet)
+library(adegraphics) #not strictly necessary for all of this (hombrew r installs will interfere)
+library(vcfR)
+library(pegas)
+library(StAMPP)
+library(ade4)
+library(MASS)
+library(reticulate)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(RColorBrewer)
+library(leaflet)
+
+vcfR2genlight.tetra <- function (x, n.cores = 1) 
+{
+  bi <- is.biallelic(x)
+  if (sum(!bi) > 0) {
+    msg <- paste("Found", sum(!bi), "loci with more than two alleles.")
+    msg <- c(msg, "\n", paste("Objects of class genlight only support loci with two alleles."))
+    msg <- c(msg, "\n", paste(sum(!bi), "loci will be omitted from the genlight object."))
+    warning(msg)
+    x <- x[bi, ]
+  }
+  x <- addID(x)
+  CHROM <- x@fix[, "CHROM"]
+  POS <- x@fix[, "POS"]
+  ID <- x@fix[, "ID"]
+  x <- extract.gt(x)
+  x[x == "0|0"] <- 0
+  x[x == "0|1"] <- 1
+  x[x == "1|0"] <- 1
+  x[x == "1|1"] <- 2
+  x[x == "0/0"] <- 0
+  x[x == "0/1"] <- 1
+  x[x == "1/0"] <- 1
+  x[x == "1/1"] <- 2
+  x[x == "1/1/1/1"] <- 4
+  x[x == "0/1/1/1"] <- 3
+  x[x == "0/0/1/1"] <- 2
+  x[x == "0/0/0/1"] <- 1
+  x[x == "0/0/0/0"] <- 0
+  x[x == "0/0/0/0/0/0"] <- 0
+  x[x == "0/0/0/0/0/1"] <- 1
+  x[x == "0/0/0/0/1/1"] <- 2
+  x[x == "0/0/0/1/1/1"] <- 3
+  x[x == "0/0/1/1/1/1"] <- 4
+  x[x == "0/1/1/1/1/1"] <- 5
+  x[x == "1/1/1/1/1/1"] <- 6
+  if (requireNamespace("adegenet")) {
+    x <- new("genlight", t(x), n.cores = n.cores)
+  }
+  else {
+    warning("adegenet not installed")
+  }
+  adegenet::chromosome(x) <- CHROM
+  adegenet::position(x) <- POS
+  adegenet::locNames(x) <- ID
+  return(x)
+}
+
+glPcaFast <- function(x,
+                      center=TRUE,
+                      scale=FALSE,
+                      nf=NULL,
+                      loadings=TRUE,
+                      alleleAsUnit=FALSE,
+                      returnDotProd=FALSE){
+  
+  if(!inherits(x, "genlight")) stop("x is not a genlight object")
+  # keep the original mean / var code, as it's used further down
+  # and has some NA checks..
+  if(center) {
+    vecMeans <- glMean(x, alleleAsUnit=alleleAsUnit)
+    if(any(is.na(vecMeans))) stop("NAs detected in the vector of means")
+  }
+  if(scale){
+    vecVar <- glVar(x, alleleAsUnit=alleleAsUnit)
+    if(any(is.na(vecVar))) stop("NAs detected in the vector of variances")
+  }
+  # convert to full data, try to keep the NA handling as similar
+  # to the original as possible
+  # - dividing by ploidy keeps the NAs
+  mx <- t(sapply(x$gen, as.integer)) / ploidy(x)
+  # handle NAs
+  NAidx <- which(is.na(mx), arr.ind = T)
+  if (center) {
+    mx[NAidx] <- vecMeans[NAidx[,2]]
+  } else {
+    mx[NAidx] <- 0
+  }
+  # center and scale
+  mx <- scale(mx,
+              center = if (center) vecMeans else F,
+              scale = if (scale) vecVar else F)
+  # all dot products at once using underlying BLAS
+  # to support thousands of samples, this could be
+  # replaced by 'Truncated SVD', but it would require more changes
+  # in the code around
+  allProd <- tcrossprod(mx) / nInd(x) # assume uniform weights
+  ## PERFORM THE ANALYSIS ##
+  ## eigenanalysis
+  eigRes <- eigen(allProd, symmetric=TRUE, only.values=FALSE)
+  rank <- sum(eigRes$values > 1e-12)
+  eigRes$values <- eigRes$values[1:rank]
+  eigRes$vectors <- eigRes$vectors[, 1:rank, drop=FALSE]
+  ## scan nb of axes retained
+  if(is.null(nf)){
+    barplot(eigRes$values, main="Eigenvalues", col=heat.colors(rank))
+    cat("Select the number of axes: ")
+    nf <- as.integer(readLines(n = 1))
+  }
+  ## rescale PCs
+  res <- list()
+  res$eig <- eigRes$values
+  nf <- min(nf, sum(res$eig>1e-10))
+  ##res$matprod <- allProd # for debugging
+  ## use: li = XQU = V\Lambda^(1/2)
+  eigRes$vectors <- eigRes$vectors * sqrt(nInd(x)) # D-normalize vectors
+  res$scores <- sweep(eigRes$vectors[, 1:nf, drop=FALSE],2, sqrt(eigRes$values[1:nf]), FUN="*")
+  ## GET LOADINGS ##
+  ## need to decompose X^TDV into a sum of n matrices of dim p*r
+  ## but only two such matrices are represented at a time
+  if(loadings){
+    if(scale) {
+      vecSd <- sqrt(vecVar)
+    }
+    res$loadings <- matrix(0, nrow=nLoc(x), ncol=nf) # create empty matrix
+    ## use: c1 = X^TDV
+    ## and X^TV = A_1 + ... + A_n
+    ## with A_k = X_[k-]^T v[k-]
+    myPloidy <- ploidy(x)
+    for(k in 1:nInd(x)){
+      temp <- as.integer(x@gen[[k]]) / myPloidy[k]
+      if(center) {
+        temp[is.na(temp)] <- vecMeans[is.na(temp)]
+        temp <- temp - vecMeans
+      } else {
+        temp[is.na(temp)] <- 0
+      }
+      if(scale){
+        temp <- temp/vecSd
+      }
+      res$loadings <- res$loadings + matrix(temp) %*% eigRes$vectors[k, 1:nf, drop=FALSE]
+    }
+    res$loadings <- res$loadings / nInd(x) # don't forget the /n of X_tDV
+    res$loadings <- sweep(res$loadings, 2, sqrt(eigRes$values[1:nf]), FUN="/")
+  }
+  ## FORMAT OUTPUT ##
+  colnames(res$scores) <- paste("PC", 1:nf, sep="")
+  if(!is.null(indNames(x))){
+    rownames(res$scores) <- indNames(x)
+  } else {
+    rownames(res$scores) <- 1:nInd(x)
+  }
+  if(!is.null(res$loadings)){
+    colnames(res$loadings) <- paste("Axis", 1:nf, sep="")
+    if(!is.null(locNames(x)) & !is.null(alleles(x))){
+      rownames(res$loadings) <- paste(locNames(x),alleles(x), sep=".")
+    } else {
+      rownames(res$loadings) <- 1:nLoc(x)
+    }
+  }
+  if(returnDotProd){
+    res$dotProd <- allProd
+    rownames(res$dotProd) <- colnames(res$dotProd) <- indNames(x)
+  }
+  res$call <- match.call()
+  class(res) <- "glPca"
+  return(res)
+}
+
+# IMPORT SNP data from VCF
+vcf <- read.vcfR("LAB_NEN_ODN.clean_BI.ann.3mbChr5.vcf.gz")   #read in all data
+
+# convert to genlight 	
+aa.genlight <- vcfR2genlight.tetra(vcf)                           ## use the modified function vcfR2genlight.tetra at the end of the file
+locNames(aa.genlight) <- paste(vcf@fix[,1],vcf@fix[,2],sep="_")   # add real SNP.names
+pop(aa.genlight)<-substr(indNames(aa.genlight),1,3)               # add pop names: here pop names are first 3 chars of ind name
+
+
+```
+
+## Assessing the Basic Genetic Structure of Three Different Populations of Cochlearia pyrenaica
+
+The three populations of study are:
+
+*‘LAB’* - sampled from Langdon Beck in the North Pennines, this is the control population, growing in a clean highland spring.
+
+*‘NEN’* - sampled from River Nent which is also in the North Pennines, this is a population growing in soil with high levels of toxic zinc.
+
+*‘ODN’* - sampled from Odin’s mine in the Peak District, this is a population growing in soil with high levels of toxic zinc and lead.
+
+
+### First, lets run a PCA to get relationships of samples/populations to one another
+
+Colouring the populations differently:
+
+```{r, echo=FALSE}
+pca.1 <- glPcaFast(aa.genlight, nf=300)
+
+#different colours:
+col <- brewer.pal(9, "Set1")
+
+# just to see pops coloured in a palette
+s.class(pca.1$scores, pop(aa.genlight),  xax=1, yax=2, col=transp(col,.6), 
+        ellipseSize=0, starSize=0, ppoints.cex=4, paxes.draw=T, pgrid.draw =F)
+
+```
+
+From this PCA it is clear to see from the clustering that the different samples are genetically dissimilar enough to form individual populations and there aren't sample mix-ups i.e. all 'LAB' samples cluster together without any overlap with the 'NEN' or 'ODN' samples. 
+
+Firstly, when looking at the ODN samples, they form a very close cluster, with no outliers, meaning all individuals within this group must be very genetically similar. The ODN population is a distance away from the LAB and NEN populations meaning there is a larger genetic difference between this population and the others. The variance in the ODN population is only explained by the first principle component (PCA1) which it has a positive association to. 
+
+When looking at the LAB population it is immediately obvious that there are a couple of outliers (LAB_500 and LAB_5), these outliers may be a part of a subgroup of individuals with mixed ancestry or have distinctive genetic features which seperates them from the rest or when collecting samples there was contamination. Disregarding the outliers the rest of the LAB samples form a tight cluster with a weaker negative relationship to PCA1 than ODN. This population also has some association to PCA2 however this is quite weak. The outliers seem to be strongly negatively associated to PCA2.
+
+Finally, when looking at the NEN population, there is again an outlier (NEN_5) which is strongly associated with PCA2, therefore this axis may explain a relationship in which the formation of subgroups in populations NEN and LAB can be explained. Disregarding the outlier, the NEN population form a slightly weaker cluster than the other populations so this population may have more variation within itself than the others. This populations variation is negatively associated with PCA1 and is slightly associated with a positive interaction with PCA2.
+
+### Does this relate to geography?
+
+It seems the data does link to geography - LAB and NEN are geographically located very close to each other (see the map below), they are both in the North Pennines, and they are clustering close together. Whereas ODN is in the Peak District and clusters further from the others. This means that the genetic differences observed between ODN and the others may be due to geographic distances - this could be climate related, due to being located in a different region ODN may have adapted to a different climate resulting in different alleles being favoured. Or the ODN population could have been isolated longer ago than the others and therefore had longer for mutations to occur and grow more genetically dissimilar to the other populations. Also due to the proximity of NEN and LAB there could have been geneflow events in their populations which resulted in their higher genetic relatedness. Therefore the variability that PC1 explains is likely to be geographical location.
+
+```{r, echo=FALSE}
+
+mymap <- leaflet() %>%
+  setView(lng = -2.2426, lat = 54.7024, zoom = 5) %>%
+  addTiles()
+
+mymap <- mymap %>% addMarkers(lng = -2.231069, lat = 54.672085, popup = "LAB")
+mymap <- mymap %>% addMarkers(lng = -2.435218, lat = 54.814972, popup = "NEN")
+mymap <- mymap %>% addMarkers(lng = -1.798148, lat = 53.347630, popup = "ODN")
+
+mymap
+
+```
+
+In the above map you can click on the points to see where each sample population is located.
+
+## Selection Scans for Detection of Outlier Regions in the Selected 3mbp Region of the Populations Genome
+
+### First lets compare the Cochlearia pyrenaica located at Langdon Beck ('LAB' - control) with those located at the River Nent ('NEN'). 
+
+We would expect to see some variability between these populations as 'NEN' are located in an extreme environment so will vary to the control ('LAB') due to adaptation, however, they are of the same species and located close together so this variability may not be extreme.
+
+```{python, echo = FALSE, warning=FALSE, fig.show='hold'}
+import subprocess
+
+cmd = [
+    "vcftools",
+    "--gzvcf", "/Users/lottieanning/LIFE4141_coursework/LAB_NEN_ODN.clean_BI.ann.3mbChr5.vcf.gz",
+    "--max-missing", "0.8",
+    "--maf", "0.05",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_LAB_population.txt",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_NEN_population.txt",
+    "--fst-window-size", "100",
+    "--fst-window-step", "100"
+]
+
+subprocess.run(cmd)
+```
+
+```{r, echo=FALSE}
+#load the Fst data, change "/Users/lottieanning/" to the file path of your out windowed weir fst file and "NEN_LAB_out_windowed_weir_fst.csv" to the name of your file
+NEN_LAB <- read.csv("/Users/lottieanning/NEN_LAB_out_windowed_weir_fst.csv")
+
+#convert 'BIN_START' to numeric (so doesnt plot as 4e+06...)
+NEN_LAB$BIN_START <- as.numeric(NEN_LAB$BIN_START)
+
+#create a top 1% threshold using quantile
+NEN_LAB_top_1_percent_threshold <- quantile(NEN_LAB$MEAN_FST, 0.99)
+
+#filter the data which is above the threshold
+NEN_LAB_selective_sweep_regions <- NEN_LAB %>% 
+  filter(MEAN_FST > NEN_LAB_top_1_percent_threshold)
+
+#create a new column indicating whether each row is part of the selective sweep regions or not
+NEN_LAB$IsSelectiveSweep <- NEN_LAB$MEAN_FST > NEN_LAB_top_1_percent_threshold
+
+#plot with fill based on the IsSelectiveSweep column
+ggplot(NEN_LAB, aes(x = BIN_START, y = MEAN_FST)) +
+  geom_point(aes(color = ifelse(IsSelectiveSweep, "red", "blue"))) +
+  labs(title = "Distribution of Mean Weir Fst Over the 3mb Region for LAB and NEN",
+       x = "Genomic Position (bp)",
+       y = "Mean Fst") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  scale_color_identity()
+
+```
+
+The above plot shows the mean Fst values for the 3mbp region at window size 100, coloured by the top 1% threshold of the mean Fst values in red and the rest of the data in blue.
+
+The mean Fst estimate was 0.035376 and the weighted Fst estimate was 0.051347 suggesting a moderate level of genetic differentiation between the two populations. This is expected as the 'NEN' population is adapted to its environment so will have different alleles to 'LAB', however, the populations are of the same species and geographically located very close together and thus will share a high amount of similarity.
+
+When using a range of window sizes the mean Fst estimate didn't change, this could be because the majority of the data does have a mean Fst of 0.035376, as shown by the graph (the individual points at y = 0.035376 arent indistinguishable), therefore when narrowing down how many base pairs are being analysed the mean doesnt change.
+
+The top 1% of the mean Fst values were above the 0.4123105 threshold, meaning any variation above this may have occured due to a selective sweep. This threshold of data seems to be fairly evenly split across the 3mb region, however, there are slight clusterings around the 5,000,000bp and 6,000,000bp regions therefore alleles which are present in NEN to cope with the high metal concentrations in their environment may be located here.
+
+### Next lets compare the Cochlearia pyrenaica located at Langdon Beck ('LAB' - control) with those located at Odins Mine ('ODN')
+
+Again some variability is expected between the control ('LAB') and the mine ('ODN') as again there is a high concentration of toxic metals, specifically Zinc and Lead in the ODN population, however they are the same species so this variability wont be drastic.
+
+```{python, echo = FALSE, warning=FALSE, fig.show='hold'}
+
+#repeat the above, changing the window size and file names to suit your analysis
+
+import subprocess
+
+cmd = [
+    "vcftools",
+    "--gzvcf", "/Users/lottieanning/LIFE4141_coursework/LAB_NEN_ODN.clean_BI.ann.3mbChr5.vcf.gz",
+    "--max-missing", "0.8",
+    "--maf", "0.05",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_LAB_population.txt",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_ODN_population.txt",
+    "--fst-window-size", "500",
+    "--fst-window-step", "500"
+]
+
+subprocess.run(cmd)
+
+```
+
+```{r, echo=FALSE}
+#load the Fst data
+ODN_LAB <- read.csv("/Users/lottieanning/ODN_LAB_out_windowed_weir_fst_500.csv")
+
+#convert 'BIN_START' to numeric (so doesnt plot as 4e+06...)
+ODN_LAB$BIN_START <- as.numeric(ODN_LAB$BIN_START)
+
+#create a top 1% threshold using quantile
+ODN_LAB_top_1_percent_threshold <- quantile(ODN_LAB$MEAN_FST, 0.99)
+
+#filter the data which is above the threshold
+ODN_LAB_selective_sweep_regions <- ODN_LAB %>% 
+  filter(MEAN_FST > ODN_LAB_top_1_percent_threshold)
+
+#create a new column indicating whether each row is part of the selective sweep regions or not
+ODN_LAB$IsSelectiveSweep <- ODN_LAB$MEAN_FST > ODN_LAB_top_1_percent_threshold
+
+#plot with fill based on the IsSelectiveSweep column
+ggplot(ODN_LAB, aes(x = BIN_START, y = MEAN_FST)) +
+  geom_point(aes(color = ifelse(IsSelectiveSweep, "red", "blue"))) +
+  labs(title = "Distribution of Mean Weir Fst Over the 3mb Region for LAB and ODN",
+       x = "Genomic Position (bp)",
+       y = "Mean Fst") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  scale_color_identity()
+```
+
+The above plot shows the mean Fst values for the 3mbp region at window size 500, coloured by the top 1% threshold of the mean Fst values in red and the rest of the data in blue. A larger window size was used here as anything smaller failed to show trends in the data (the plot was too condensed) possibly due to a smaller sample size (4834 observations compared to LAB/NEN which had 16767 observations).
+
+Again when using a range of window size the Fst Estimates did not change. The mean Fst estimate was 0.19277 and the weighted Fst estimate was 0.29316 suggesting a higher level of genetic differentiation between these two populations. This may be explained by geographic location as LAB and NEN are located very close together compared to LAB and ODN which are further apart.
+
+The top 1% of the mean Fst values were above the 0.7051703 threshold, meaning any variation above this may have occurred due to a selective sweep. This threshold of data seems to be fairly evenly split across the 3mbp region however there are slight clusterings around the 4,600,000bp, 5,000,000bp, 6,000,000bp, and 6,700,000bp regions therefore alleles which are present in ODN to cope with the high metal concentrations in their environment may be located here.
+
+### Finally, just for interest, lets compare the Cochlearia pyrenaica located at The River Nent ('NEN') with those located at Odins Mine ('ODN')
+
+These two populations are both located in extreme environments, with high levels of toxic metals so higher levels of similarity might be expected, however, as they are located at different mines and far apart the adaptation to the extreme environments likely has occurred on different genes, in this case high genetic differentiation would be observed.
+
+```{python, echo = FALSE, warning = FALSE, fig.show='hold'}
+import subprocess
+
+cmd = [
+    "vcftools",
+    "--gzvcf", "/Users/lottieanning/LIFE4141_coursework/LAB_NEN_ODN.clean_BI.ann.3mbChr5.vcf.gz",
+    "--max-missing", "0.8",
+    "--maf", "0.05",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_NEN_population.txt",
+    "--weir-fst-pop", "/Users/lottieanning/LIFE4141_coursework/nano_ODN_population.txt",
+    "--fst-window-size", "500",
+    "--fst-window-step", "500"
+]
+
+subprocess.run(cmd)
+
+```
+
+```{r, echo=FALSE}
+#load the Fst data
+NEN_ODN <- read.csv("/Users/lottieanning/NEN_ODN_out_windowed_weir_fst_500.csv")
+
+#convert 'BIN_START' to numeric (so doesnt plot as 4e+06...)
+NEN_ODN$BIN_START <- as.numeric(NEN_ODN$BIN_START)
+
+#create the top 1% threshold
+NEN_ODN_top_1_percent_threshold <- quantile(NEN_ODN$MEAN_FST, 0.99)
+
+#filter data to this threshold
+NEN_ODN_selective_sweep_regions <- NEN_ODN %>% 
+  filter(MEAN_FST > NEN_ODN_top_1_percent_threshold)
+
+#create a new column indicating whether each row is part of the selective sweep regions or not
+NEN_ODN$IsSelectiveSweep <- NEN_ODN$MEAN_FST > NEN_ODN_top_1_percent_threshold
+
+#plot with fill based on the IsSelectiveSweep column
+ggplot(NEN_ODN, aes(x = BIN_START, y = MEAN_FST)) +
+  geom_point(aes(color = ifelse(IsSelectiveSweep, "red", "blue"))) +
+  labs(title = "Distribution of Mean Weir Fst Over the 3mb Region for ODN and NEN",
+       x = "Genomic Position (bp)",
+       y = "Mean Fst") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  scale_color_identity()
+```
+
+The above plot shows the mean Fst values for the 3mbp region at window size 500, coloured by the top 1% threshold of the mean Fst values in red and the rest of the data in blue. 
+
+Again when using a range of window size the Fst Estimates didn't change. The mean Fst estimate was 0.20882 and the weighted Fst estimate was 0.31109 therefore these populations show the highest level of genetic differentiation between all 3. This would be expected as they are located far apart and both must have adapted separately to extreme environments.
+
+The top 1% of the mean Fst values were above the 0.7410197 threshold, meaning any variation above this may have occurred due to a selective sweep. This threshold of data seems to be fairly evenly split across the 3mb region, with slight clusterings around the 4,300,000bp, 4,600,000bp, 5,000,000bp, 6,000,000bp and between the 6,500,000bp and 7,000,000bp regions meaning that alleles located here might all have changed somewhat to adapt to the harsh environment.
+
+#### Overall there is genetic differentiation seen in all three populations with the biggest difference observed between the NEN and ODN populations, this is supported with the clustering analysis where ODN is further from NEN and LAB. This could suggest the genetic differences observed are partly due to geographical distances and partly due to different genes evolving to the environments. The differences overall do seem to crop up in many locations over the 3mbp region however trends are seen around the 5,000,000bp and 6,000,000bp regions.
+
+## Identifying Candidate Genes
+
+We won't be looking at comparisons between the NEN and ODN populations as this doesnt tell us which genes crop up in which poulations, rather just which genes are different between populations. We can get this from the comparisons of the extreme populations and the control.
+
+The 3mb region that was sequenced for LAB, ODN and NEN is on Cexcelsa scaffold 5 from 4,000,201bp to 7,000,000bp. When looking at the top 1% of Fst means for the comparisons between the control and NEN there are 168 observations, and with the control and ODN there are 49 observations. After the intersection with bedtools there are 68 genes in the LAB/NEN comparison and 20 in the LAB/ODN comparison which may have occured due to a selective sweep.
+
+```{r, echo=FALSE}
+
+#first create a data frame with columns 'chr', 'start' and 'end' which contains only the selective sweep regions start and end base pair regions 
+bed_format <- data.frame(chr = NEN_LAB_selective_sweep_regions$CHROM, start = NEN_LAB_selective_sweep_regions$BIN_START, end = NEN_LAB_selective_sweep_regions$BIN_END)
+write.table(bed_format, file = "NEN_LAB_selective_sweep_regions.bed", sep = "\t", col.names = FALSE, quote = FALSE, row.names = FALSE)
+
+bed_format <- data.frame(chr = ODN_LAB_selective_sweep_regions$CHROM, start = ODN_LAB_selective_sweep_regions$BIN_START, end = ODN_LAB_selective_sweep_regions$BIN_END)
+write.table(bed_format, file = "ODN_LAB_selective_sweep_regions.bed", sep = "\t", col.names = FALSE, quote = FALSE, row.names = FALSE)
+
+```
+
+```{bash, echo = FALSE}
+
+#in terminal run the following commands, make sure the gff3 file is first so that useful information isnt lost
+bedtools intersect -a C_excelsa_V5_braker2_wRseq.gff3 -b NEN_LAB_selective_sweep_regions.bed > overlap_NEN_LAB.bed
+bedtools intersect -a C_excelsa_V5_braker2_wRseq.gff3 -b ODN_LAB_selective_sweep_regions.bed > overlap_ODN_LAB.bed
+
+```
+
+
+#### Genes related to metal in the LAB/NEN comparison:
+
+```{r, echo=FALSE}
+
+#load bedtool outputs back into R:
+overlap_NEN_LAB <- read.delim("overlap_NEN_LAB.bed", header = FALSE)
+overlap_ODN_LAB <- read.delim("overlap_ODN_LAB.bed", header = FALSE)
+
+#get all gene ids for NEN_LAB (in column v9):
+gene_ids_NEN_LAB <- strsplit(overlap_NEN_LAB[, 9], ";")
+
+#create an empty list to store them:
+gene_ids <- list()
+
+#for loop to search for gene ids, remove "ID=", keep the next 9 characters and add them to the empty list
+for (x in gene_ids_NEN_LAB) {
+  gene_id <- grep("^ID=", x, value = TRUE)
+  if (length(gene_id) > 0) {
+    gene_id <- gsub("^ID=", "", gene_id) #remove "ID="
+    gene_id <- substr(gene_id, 1, 9) #was 1:6 to only have gene id but when looking at gene description all have .t1...
+    gene_ids <- c(gene_ids, list(gene_id))
+  }
+}
+
+#use unique() to only store 1 copy of the gene id
+NEN_LAB_unique_gene_ids <- unique(gene_ids)
+
+#list of 139 (68 genes with and without ".t1")
+
+#read in adjusted file for descriptions - only included gene IDs starting with g23 and g24 bc otherwise file was too big
+gene_description <- read.csv("1-2-1_hits_23-24_gene_descriptions.csv")
+
+#create an empty data frame with columns 'GeneID' and 'Description'
+NEN_LAB_gene_descriptions <- data.frame(GeneID = character(), Description = character(), stringsAsFactors = FALSE)
+
+#for loop to check if the NEN/LAB gene id is in the description list
+for (gene_id in NEN_LAB_unique_gene_ids) {
+  if (gene_id %in% gene_description$CochleariaID) {
+    description <- gene_description$Athaliana_description[gene_description$CochleariaID == gene_id]
+    NEN_LAB_gene_descriptions <- rbind(NEN_LAB_gene_descriptions, data.frame(GeneID = gene_id, Description = description, stringsAsFactors = FALSE))
+  }
+}
+
+#print only the gene ids with metal in the description
+metal <- NEN_LAB_gene_descriptions %>%
+  filter(str_detect(Description, "metal"))
+print(metal)
+
+```
+
+The above output shows three gene ids from the NEN/LAB comparison which are related to metal. Firstly, g23836.t1 which is a CRT-like transporter 2 which reduces heavy-metal sensitivity, this is most likely a mutation that the NEN population has, to cope with the heavy-metal environement it is located in. Next, the g23929.t1 which is a heavy metal atpase 2 involved in transporting Zinc (the metal which is heavily present in the River Nent) and detoxifies the cell which again could be an adaptation of the NEN population. And lastly, g24115.t1 which is a iron-regulated transporter 1 which mediated the transport of zinc and other heavy metals.
+
+The other 65 genes which could have been the result of a selective sweep are linked to growth and disease avoidance therefore could be adaptations to the location of NEN and LAB.
+
+
+#### Genes related to metal in the LAB/ODN comparison:
+
+```{r, echo=FALSE}
+#repeat for ODN_LAB
+gene_ids_ODN_LAB <- strsplit(overlap_ODN_LAB[, 9], ";")
+gene_ids <- list()
+
+for (x in gene_ids_ODN_LAB) {
+  gene_id <- grep("^ID=", x, value = TRUE)
+  if (length(gene_id) > 0) {
+    gene_id <- gsub("^ID=", "", gene_id)
+    gene_id <- substr(gene_id, 1, 9)
+    gene_ids <- c(gene_ids, list(gene_id))
+  }
+}
+
+ODN_LAB_unique_gene_ids <- unique(gene_ids)
+
+#list of 21 genes (doubled for with and without '.t1')
+
+#create an empty data frame
+ODN_LAB_gene_descriptions <- data.frame(GeneID = character(), Description = character(), stringsAsFactors = FALSE)
+
+#for loop to check if the ODN/LAB gene id is in the description list
+for (gene_id in ODN_LAB_unique_gene_ids) {
+  if (gene_id %in% gene_description$CochleariaID) {
+    description <- gene_description$Athaliana_description[gene_description$CochleariaID == gene_id]
+    ODN_LAB_gene_descriptions <- rbind(ODN_LAB_gene_descriptions, data.frame(GeneID = gene_id, Description = description, stringsAsFactors = FALSE))
+  }
+}
+
+#print the gene id if metal is in the description:
+metal <- ODN_LAB_gene_descriptions %>%
+  filter(str_detect(Description, "metal"))
+print(metal)
+```
+
+Interestingly, the g23929.t1 is also present in the LAB/ODN comparison which presumably means that this heavy metal atpase 2 is important to survival in environments with high amounts of heavy metal. Furthermore, both ODN and NEN have this allele which goes against the earlier assumptions that they adapted differently to their environments (although this is still partly supported as NEN has other alleles linked to heavy metal adaptation). Again the other genes which cropped up in the top 1% of mean Fst scores are to do with stamen growth and other disease prevention genes which may again be alleles aiding in the adaptation to extreme environments.
+
+#### In conclusion, it seems that there are alleles at play which aid in the ability for NEN and ODN populations to live in their extreme environments. Specifically g23929.t1, a heavy metal atpase 2, which allows for the transport of Zinc and detoxification of the cells of the plant. Furthermore, due to their geographical locations there are other alleles which have fixated in their populations to specify the plants structure to their environment. This means that these Cochlearia pyrenaica's have adapted genetically to their enviornments and future research could look into the specific morphology of g23929.t1 to further understand its role in Zinc environement adaptation.
+
+
+
+
+
+
+
